@@ -1,4 +1,4 @@
-# VBScript-Remediation
+# VBScript Remediation
 This repository is for various scripts and tools to help deal with the forthcoming deprecation of VBScript.
 
 ## Get-MSIVBScriptReport.ps1
