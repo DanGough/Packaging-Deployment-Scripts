@@ -1,3 +1,11 @@
+# -------------------------
+# Get-MSIVBScriptReport.ps1
+# -------------------------
+# Written by Dan Gough
+# -------------------------
+# v1.0 - Initial release
+# v1.1 - Improved MST handling logic and changed output fields
+
 param (
     [string]$Path = $PWD,
     [string]$OutputFile
@@ -12,41 +20,86 @@ if (-not (Get-InstalledModule -Name 'MSI' -ErrorAction SilentlyContinue)) {
     Install-Module -Name 'MSI' -Repository PSGallery -Scope CurrentUser -ErrorAction Stop
 }
 
-# Where-Object seems redundant here but is necessary to stop returning msix packages
-$MSIs = Get-ChildItem -Path $Path -Filter '*.msi' -Recurse -ErrorAction SilentlyContinue | Where-Object Extension -eq '.msi'
+# Get all MSI and MST files
+$Files = Get-ChildItem -Path $Path -Filter '*.ms*' -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.Extension -eq '.msi' -or $_.Extension -eq '.mst' }
 
 $Counter = 0
 
-$Report = foreach ($MSI in $MSIs) {
+$Report = foreach ($File in $Files) {
 
     $Counter++
-    $PercentComplete = [System.Math]::Floor($Counter / $MSIs.Count * 100)
-    Write-Progress -Activity "Processing $Counter of $($MSIs.Count)" -Status $MSI.Name -PercentComplete $PercentComplete
+    $PercentComplete = [System.Math]::Floor($Counter / $Files.Count * 100)
+    Write-Progress -Activity "Processing $Counter of $($Files.Count)" -Status $File.Name -PercentComplete $PercentComplete
 
-    # Try the MSI by itself (null MST) and also with every MST found in the same folder
-    $MSTs = @($null) + (Get-ChildItem -Path $MSI.PSParentPath -Filter '*.mst' -ErrorAction SilentlyContinue)
+    if ($File.Extension -eq '.msi') {
+        try {
+            Write-Verbose "Opening $($File.FullName)..."
+            $Properties = $CustomActions = $FileNames = $null # Reset to null each time in case assignment via Get-MSITable fails
+            $Properties = Get-MSITable -Path $File.FullName -Table 'Property' -ErrorAction Stop # ErrorAction Stop here to trigger the catch block if MSI is locked or invalid
+            $CustomActions = @(Get-MSITable -Path $File.FullName -Table 'CustomAction' -ErrorAction SilentlyContinue).Where({ ($_.Type -band 0x6) -eq 0x6 }).Action # ErrorAction SilentlyContinue as some packages have no CustomAction table
+            $FileNames = @(Get-MSITable -Path $File.FullName -Table 'File' -ErrorAction SilentlyContinue).Where({ $_.FileName -like '*.vbs' }).FileName.ForEach({ $_.Split('|')[-1] }) # ErrorAction SilentlyContinue as some packages have no File table
+    
+            if ($CustomActions -or $FileNames) {
+                [PSCustomObject]@{
+                    File           = $File.FullName
+                    Manufacturer   = $Properties.Where({ $_.Property -eq 'Manufacturer' }).Value
+                    ProductName    = $Properties.Where({ $_.Property -eq 'ProductName' }).Value
+                    ProductVersion = $Properties.Where({ $_.Property -eq 'ProductVersion' }).Value
+                    CustomActions  = $CustomActions -join '; '
+                    VbsFiles       = $FileNames -join '; '
+                }
+            }
+        }
+        catch {
+            Write-Error $_
+            continue
+        }
+    }
+    elseif ($File.Extension -eq '.mst') {
 
-    foreach ($MST in $MSTs) {
+        $MSICandidates = Get-ChildItem -Path $File.PSParentPath -Filter '*.msi' -ErrorAction SilentlyContinue # Get all MSI packages from the same folder
 
-        $CustomActions = $Files = $null # Reset as if Get-MSITable fails it does not return $null
-        
-        $CustomActions = @(Get-MSITable -Path $MSI.FullName -Transform $MST.FullName -Table 'CustomAction' -ErrorAction SilentlyContinue).Where({ ($_.Type -band 0x6) -eq 0x6 })
-        $Files = @(Get-MSITable -Path $MSI.FullName -Transform $MST.FullName -Table 'File' -ErrorAction SilentlyContinue).Where({ $_.FileName -like '*.vbs' })
-        $Properties = Get-MSITable -Path $MSI.FullName -Transform $MST.FullName -Table 'Property'
-        
-        if ($CustomActions -or $Files) {
+        # Try MST with every MSI found in the same folder, collecting CustomActions and FileNames that do not belong in the base MSI, summing together as risk of some MSIs not having both CustomAction & File tables
+        $MSTCustomActions = @()
+        $MSTFileNames = @()
+
+        foreach ($MSICandidate in $MSICandidates) {
+
+            Write-Verbose "Trying $($File.FullName) with $($MSICandidate.FullName)..."
+
+            try {
+                $TransformedProperties = $TransformedCustomActions = $TransformedFileNames = $BaseCustomActions = $BaseFileNames = $null # Reset to null each time in case assignment via Get-MSITable fails
+                $TransformedProperties = Get-MSITable -Path $MSICandidate.FullName -Transform $File.FullName -Table 'Property' -ErrorAction Stop # ErrorAction Stop here to trigger the catch block if applying MST fails
+                $BaseCustomActions = @(Get-MSITable -Path $MSICandidate.FullName -Table 'CustomAction' -ErrorAction SilentlyContinue).Where({ ($_.Type -band 0x6) -eq 0x6 }).Action
+                $BaseFileNames = @(Get-MSITable -Path $MSICandidate.FullName -Table 'File' -ErrorAction SilentlyContinue).Where({ $_.FileName -like '*.vbs' }).FileName.ForEach({ $_.Split('|')[-1] })
+                $TransformedCustomActions = @(Get-MSITable -Path $MSICandidate.FullName -Transform $File.FullName -Table 'CustomAction' -ErrorAction SilentlyContinue).Where({ ($_.Type -band 0x6) -eq 0x6 }).Action
+                $TransformedFileNames = @(Get-MSITable -Path $MSICandidate.FullName -Transform $File.FullName -Table 'File' -ErrorAction SilentlyContinue).Where({ $_.FileName -like '*.vbs' }).FileName.ForEach({ $_.Split('|')[-1] })
+                $MSTCustomActions += ($TransformedCustomActions | Where-Object { $_ -notin $BaseCustomActions }) 
+                $MSTFileNames += ($TransformedFileNames | Where-Object { $_ -notin $BaseFileNames })
+            }
+            catch {
+                Write-Verbose "Error applying transform: $_"
+                continue
+            }
+
+        }
+
+        # Remove duplicates
+        $MSTCustomActions = $MSTCustomActions | Select-Object -Unique
+        $MSTFileNames = $MSTFileNames | Select-Object -Unique
+
+        if ($MSTCustomActions -or $MSTFileNames) {
             [PSCustomObject]@{
-                Path           = Split-Path -Path $MSI.FullName -Parent
-                MSI            = $MSI.Name
-                MST            = $MST.Name
-                Manufacturer   = $Properties.Where({$_.Property -eq 'Manufacturer'}).Value
-                ProductName    = $Properties.Where({$_.Property -eq 'ProductName'}).Value
-                ProductVersion = $Properties.Where({$_.Property -eq 'ProductVersion'}).Value
-                CustomActions  = $CustomActions.Action -join "; "
-                Files          = $Files.FileName.ForEach({ $_.Split('|')[-1] }) -join "; "
+                File           = $File.FullName
+                Manufacturer   = $null
+                ProductName    = $null
+                ProductVersion = $null
+                CustomActions  = $MSTCustomActions -join '; '
+                VbsFiles       = $MSTFileNames -join '; '
             }
         }
     }
+
 }
 Write-Progress -Completed -Activity 'Clear Progress Bar'
 
@@ -105,5 +158,5 @@ if ($Report.Count) {
 
 }
 else {
-    Write-Host "No affected MSI packages found in $Path."
+    Write-Host "No affected files found in $Path."
 }
